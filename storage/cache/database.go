@@ -42,6 +42,8 @@ const (
 	Recommend                        = "recommend"
 	RecommendDigest                  = "recommend_digest"
 	RecommendUpdateTime              = "recommend_update_time"
+	SourceRecommendRaw               = "source-recommend-raw"        // per-source raw (pre-exclude) scores for incremental updates
+	SourceRecommendRawDigest         = "source-recommend-raw_digest" // digest for per-source raw cache
 
 	// ItemCategories is the set of item categories. The format of key:
 	//	Global item categories - item_categories
@@ -49,6 +51,7 @@ const (
 
 	LastModifyItemTime = "last_modify_item_time" // the latest timestamp that a user related data was modified
 	LastModifyUserTime = "last_modify_user_time" // the latest timestamp that an item related data was modified
+	PendingUsers      = "pending_users"         // queue of user IDs pending incremental recomputation
 
 	// GlobalMeta is global meta information
 	GlobalMeta                 = "global_meta"
@@ -79,6 +82,7 @@ var ItemCache = []string{
 	NonPersonalized,
 	ItemToItem,
 	Recommend,
+	SourceRecommendRaw,
 }
 
 var (

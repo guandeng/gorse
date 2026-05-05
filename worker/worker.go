@@ -94,6 +94,7 @@ type Worker struct {
 	ticker       *time.Ticker
 	syncedChan   chan struct{} // meta synced events
 	pulledChan   chan struct{} // model pulled events
+	pendingChan    chan struct{} // pending users available events
 }
 
 // NewWorker creates a new worker node.
@@ -127,6 +128,7 @@ func NewWorker(
 		ticker:       time.NewTicker(interval),
 		syncedChan:   make(chan struct{}, 1),
 		pulledChan:   make(chan struct{}, 1),
+		pendingChan:    make(chan struct{}, 1),
 	}
 }
 
@@ -357,8 +359,9 @@ func (w *Worker) Serve() {
 	go w.Sync()
 	go w.Pull()
 	go w.ServeHTTP()
+	go w.pollPendingUsersAfterSync(context.Background())
 
-	loop := func() {
+	fullSweep := func() {
 		// pull users
 		workingUsers, err := w.pullUsers(w.peers, w.me)
 		if err != nil {
@@ -381,14 +384,35 @@ func (w *Worker) Serve() {
 		})
 	}
 
+	incrementalUpdate := func() {
+		pendingUsers, err := w.drainPendingUsers()
+		if err != nil {
+			log.Logger().Error("failed to drain pending users", zap.Error(err))
+			return
+		}
+		if len(pendingUsers) > 0 {
+			log.Logger().Info("processing pending users",
+				zap.Int("n_pending_users", len(pendingUsers)))
+			w.IncrementalRecommend(context.Background(), pendingUsers, func(completed, throughput int) {
+				if w.masterClient != nil {
+					if _, err := w.masterClient.PushProgress(context.Background(), monitor.EncodeProgress(w.Tracer.List())); err != nil {
+						log.Logger().Error("failed to report update task", zap.Error(err))
+					}
+				}
+			})
+		}
+	}
+
 	for {
 		select {
 		case tick := <-w.ticker.C:
 			if time.Since(tick) <= w.tickDuration {
-				loop()
+				fullSweep()
 			}
 		case <-w.pulledChan:
-			loop()
+			fullSweep()
+		case <-w.pendingChan:
+			incrementalUpdate()
 		}
 	}
 }
@@ -435,6 +459,88 @@ func (w *Worker) pullUsers(peers []string, me string) ([]data.User, error) {
 		return nil, errors.Trace(err)
 	}
 	return users, nil
+}
+
+func (w *Worker) drainPendingUsers() ([]data.User, error) {
+	ctx := context.Background()
+	c := consistent.New()
+	for _, peer := range w.peers {
+		c.Add(peer)
+	}
+	batchSize := w.Config.Recommend.IncrementalBatchSize
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	var myUsers []data.User
+	for i := 0; i < batchSize; i++ {
+		userId, err := w.CacheClient.Pop(ctx, cache.PendingUsers)
+		if err != nil {
+			break
+		}
+		target, err := c.Get(userId)
+		if err != nil {
+			continue
+		}
+		if target == w.me {
+			user, err := w.DataClient.GetUser(ctx, userId)
+			if err != nil {
+				log.Logger().Error("failed to get pending user",
+					zap.String("user_id", userId), zap.Error(err))
+				continue
+			}
+			myUsers = append(myUsers, user)
+		} else {
+			if err := w.CacheClient.Push(ctx, cache.PendingUsers, userId); err != nil {
+				log.Logger().Error("failed to re-push pending user",
+					zap.String("user_id", userId), zap.Error(err))
+			}
+		}
+	}
+	return myUsers, nil
+}
+
+func (w *Worker) pollPendingUsersAfterSync(ctx context.Context) {
+	// Wait for Sync() to complete: CacheClient initialized and config loaded from master
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if w.CacheClient != nil && w.Config.Recommend.IncrementalEnabled {
+				w.pollPendingUsers(ctx)
+				return
+			}
+		}
+	}
+}
+
+func (w *Worker) pollPendingUsers(ctx context.Context) {
+	interval := w.Config.Recommend.IncrementalPollInterval
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			remain, err := w.CacheClient.Remain(context.Background(), cache.PendingUsers)
+			if err != nil {
+				log.Logger().Error("failed to check pending queue", zap.Error(err))
+				continue
+			}
+			if remain > 0 {
+				select {
+				case w.pendingChan <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}
 }
 
 type HealthStatus struct {

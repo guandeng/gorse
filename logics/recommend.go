@@ -44,12 +44,13 @@ type Recommender struct {
 	cacheClient cache.Database
 	dataClient  data.Database
 
-	online       bool
-	coldstart    bool
-	userId       string
-	userFeedback []data.Feedback
-	categories   []string
-	excludeSet   mapset.Set[string]
+	online           bool
+	coldstart        bool
+	userId           string
+	userFeedback     []data.Feedback
+	categories       []string
+	excludeSet       mapset.Set[string]
+	skipExcludeFilter bool // when true, source functions return raw scores without exclude-set filtering
 }
 
 type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
@@ -130,7 +131,7 @@ func (r *Recommender) Recommend(ctx context.Context, limit int) (result []cache.
 func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Score, limit int, names ...string) ([]cache.Score, string, error) {
 	var digests []string
 	for _, name := range names {
-		recommenderFunc, err := r.parse(name)
+		recommenderFunc, err := r.Parse(name)
 		if err != nil {
 			return nil, "", errors.Trace(err)
 		}
@@ -150,7 +151,7 @@ func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Sc
 	return result, util.MD5(digests...), nil
 }
 
-func (r *Recommender) parse(fullname string) (RecommenderFunc, error) {
+func (r *Recommender) Parse(fullname string) (RecommenderFunc, error) {
 	if fullname == CollaborativeRecommender {
 		return r.recommendCollaborative, nil
 	} else if fullname == LatestRecommender {
@@ -183,7 +184,7 @@ func (r *Recommender) recommendLatest(ctx context.Context) ([]cache.Score, strin
 	}
 	scores := make([]cache.Score, 0, len(items))
 	for _, item := range items {
-		if !r.excludeSet.Contains(item.ItemId) {
+		if r.skipExcludeFilter || !r.excludeSet.Contains(item.ItemId) {
 			scores = append(scores, cache.Score{
 				Id:         item.ItemId,
 				Score:      float64(item.Timestamp.Unix()),
@@ -213,6 +214,9 @@ func (r *Recommender) recommendNonPersonalized(name string) RecommenderFunc {
 			return nil, "", errors.Trace(err)
 		}
 		// remove excluded items
+		if r.skipExcludeFilter {
+			return items, digest, nil
+		}
 		return lo.Filter(items, func(item cache.Score, index int) bool {
 			return !r.excludeSet.Contains(item.Id)
 		}), digest, nil
@@ -231,6 +235,9 @@ func (r *Recommender) recommendCollaborative(ctx context.Context) ([]cache.Score
 		return nil, "", errors.Trace(err)
 	}
 	// remove excluded items
+	if r.skipExcludeFilter {
+		return items, digest, nil
+	}
 	return lo.Filter(items, func(item cache.Score, index int) bool {
 		return !r.excludeSet.Contains(item.Id)
 	}), digest, nil
@@ -263,7 +270,7 @@ func (r *Recommender) recommendItemToItem(name string) RecommenderFunc {
 				return nil, "", errors.Trace(err)
 			}
 			for _, item := range similarItems {
-				if !r.excludeSet.Contains(item.Id) {
+				if r.skipExcludeFilter || !r.excludeSet.Contains(item.Id) {
 					scores[item.Id] += item.Score
 					categories[item.Id] = item.Categories
 					digests.Add(digest)
@@ -308,7 +315,7 @@ func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 			}
 			// add unseen items
 			for _, feedback := range feedbacks {
-				if !r.excludeSet.Contains(feedback.ItemId) {
+				if r.skipExcludeFilter || !r.excludeSet.Contains(feedback.ItemId) {
 					scores[feedback.ItemId] += user.Score
 				}
 			}
@@ -378,7 +385,7 @@ func (r *Recommender) recommendExternal(name string) RecommenderFunc {
 		}
 		scores := make([]cache.Score, 0, len(items))
 		for _, itemId := range items {
-			if !r.excludeSet.Contains(itemId) {
+			if r.skipExcludeFilter || !r.excludeSet.Contains(itemId) {
 				scores = append(scores, cache.Score{
 					Id: itemId,
 				})
@@ -386,4 +393,65 @@ func (r *Recommender) recommendExternal(name string) RecommenderFunc {
 		}
 		return scores, externalConfig.Hash(), nil
 	}
+}
+
+// IsFeedbackDependent returns true if the recommender source directly reads user feedback.
+// Feedback-dependent sources must be recomputed on feedback changes.
+func IsFeedbackDependent(sourceName string) bool {
+	if strings.HasPrefix(sourceName, ItemToItemRecommender) {
+		return true
+	}
+	if strings.HasPrefix(sourceName, ExternalRecommender) {
+		return true
+	}
+	return false
+}
+
+// RecommendSourcesWithCaching is like RecommendSequential but also caches each source's
+// raw (pre-exclude-set) scores for use in incremental updates.
+func (r *Recommender) RecommendSourcesWithCaching(
+	ctx context.Context,
+	result []cache.Score,
+	limit int,
+	names ...string,
+) ([]cache.Score, string, error) {
+	var digests []string
+	for _, name := range names {
+		recommenderFunc, err := r.Parse(name)
+		if err != nil {
+			return nil, "", errors.Trace(err)
+		}
+
+		// Get raw (unfiltered) scores for caching
+		r.skipExcludeFilter = true
+		rawScores, digest, err := recommenderFunc(ctx)
+		r.skipExcludeFilter = false
+		if err != nil {
+			return nil, "", errors.Trace(err)
+		}
+
+		// Cache raw scores for incremental updates (best-effort)
+		if r.cacheClient != nil && len(rawScores) > 0 {
+			_ = r.cacheClient.AddScores(ctx, cache.SourceRecommendRaw,
+				cache.Key(r.userId, name), rawScores)
+			_ = r.cacheClient.Set(ctx,
+				cache.String(cache.Key(cache.SourceRecommendRawDigest, r.userId, name), digest))
+		}
+
+		// Apply exclude-set filtering (waterfall)
+		filtered := make([]cache.Score, 0, len(rawScores))
+		for _, score := range rawScores {
+			if !r.excludeSet.Contains(score.Id) {
+				r.excludeSet.Add(score.Id)
+				filtered = append(filtered, score)
+			}
+		}
+
+		result = append(result, filtered...)
+		digests = append(digests, digest)
+		if limit > 0 && len(result) >= limit {
+			return result[:limit], util.MD5(digests...), nil
+		}
+	}
+	return result, util.MD5(digests...), nil
 }

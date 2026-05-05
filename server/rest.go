@@ -1045,6 +1045,11 @@ func (s *RestServer) insertUser(request *restful.Request, response *restful.Resp
 		InternalServerError(response, err)
 		return
 	}
+	if s.Config.Recommend.IncrementalEnabled {
+		if err := s.CacheClient.Push(ctx, cache.PendingUsers, temp.UserId); err != nil {
+			log.Logger().Error("failed to enqueue pending user", zap.String("user_id", temp.UserId), zap.Error(err))
+		}
+	}
 	Ok(response, Success{RowAffected: 1})
 }
 
@@ -1073,6 +1078,11 @@ func (s *RestServer) modifyUser(request *restful.Request, response *restful.Resp
 	// insert modify timestamp
 	if err := s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, userId), time.Now())); err != nil {
 		return
+	}
+	if s.Config.Recommend.IncrementalEnabled {
+		if err := s.CacheClient.Push(ctx, cache.PendingUsers, userId); err != nil {
+			log.Logger().Error("failed to enqueue pending user", zap.String("user_id", userId), zap.Error(err))
+		}
 	}
 	Ok(response, Success{RowAffected: 1})
 }
@@ -1128,6 +1138,13 @@ func (s *RestServer) insertUsers(request *restful.Request, response *restful.Res
 	if err := s.CacheClient.Set(ctx, values...); err != nil {
 		InternalServerError(response, err)
 		return
+	}
+	if s.Config.Recommend.IncrementalEnabled {
+		for _, user := range temp {
+			if err := s.CacheClient.Push(ctx, cache.PendingUsers, user.UserId); err != nil {
+				log.Logger().Error("failed to enqueue pending user", zap.String("user_id", user.UserId), zap.Error(err))
+			}
+		}
 	}
 	Ok(response, Success{RowAffected: len(temp)})
 }
@@ -1578,6 +1595,15 @@ func (s *RestServer) insertFeedback(overwrite bool) func(request *restful.Reques
 		if err = s.CacheClient.Set(ctx, values...); err != nil {
 			InternalServerError(response, err)
 			return
+		}
+		// enqueue affected users for incremental recomputation
+		if s.Config.Recommend.IncrementalEnabled {
+			for _, userId := range users.ToSlice() {
+				if err := s.CacheClient.Push(ctx, cache.PendingUsers, userId); err != nil {
+					log.Logger().Error("failed to enqueue pending user",
+						zap.String("user_id", userId), zap.Error(err))
+				}
+			}
 		}
 		log.ResponseLogger(response).Info("Insert feedback successfully", zap.Int("num_feedback", len(feedback)))
 		Ok(response, Success{RowAffected: len(feedback)})

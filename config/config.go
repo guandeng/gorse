@@ -168,6 +168,9 @@ type RecommendConfig struct {
 	Replacement     ReplacementConfig       `mapstructure:"replacement"`
 	Ranker          RankerConfig            `mapstructure:"ranker"`
 	Fallback        FallbackConfig          `mapstructure:"fallback"`
+	IncrementalEnabled     bool          `mapstructure:"incremental_enabled"`
+	IncrementalBatchSize   int           `mapstructure:"incremental_batch_size"`
+	IncrementalPollInterval time.Duration `mapstructure:"incremental_poll_interval"`
 }
 
 func (r *RecommendConfig) ListRecommenders() []string {
@@ -500,6 +503,9 @@ func GetDefaultConfig() *Config {
 				PositiveReplacementDecay: 0.8,
 				ReadReplacementDecay:     0.6,
 			},
+			IncrementalEnabled:      false,
+			IncrementalBatchSize:    100,
+			IncrementalPollInterval: 30 * time.Second,
 			Ranker: RankerConfig{
 				Type:           "none",
 				CacheExpire:    120 * time.Hour,
@@ -635,6 +641,10 @@ func setDefault() {
 	viper.SetDefault("recommend.replacement.enable_replacement", defaultConfig.Recommend.Replacement.EnableReplacement)
 	viper.SetDefault("recommend.replacement.positive_replacement_decay", defaultConfig.Recommend.Replacement.PositiveReplacementDecay)
 	viper.SetDefault("recommend.replacement.read_replacement_decay", defaultConfig.Recommend.Replacement.ReadReplacementDecay)
+	// [recommend.incremental]
+	viper.SetDefault("recommend.incremental_enabled", defaultConfig.Recommend.IncrementalEnabled)
+	viper.SetDefault("recommend.incremental_batch_size", defaultConfig.Recommend.IncrementalBatchSize)
+	viper.SetDefault("recommend.incremental_poll_interval", defaultConfig.Recommend.IncrementalPollInterval)
 	// [recommend.ranker]
 	viper.SetDefault("recommend.ranker.type", defaultConfig.Recommend.Ranker.Type)
 	viper.SetDefault("recommend.ranker.cache_expire", defaultConfig.Recommend.Ranker.CacheExpire)

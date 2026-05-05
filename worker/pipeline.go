@@ -187,7 +187,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 		} else {
 			recommenderNames = p.Config.Recommend.ListRecommenders()
 		}
-		scores, digest, err = recommender.RecommendSequential(ctx, scores, 0, recommenderNames...)
+		scores, digest, err = recommender.RecommendSourcesWithCaching(ctx, scores, 0, recommenderNames...)
 		if err != nil {
 			log.Logger().Error("failed to recommend items", zap.String("user_id", userId), zap.Error(err))
 			return
@@ -618,6 +618,245 @@ func (p *Pipeline) applyReplacementDecay(
 		cache.SortDocuments(updated)
 	}
 	return updated
+}
+
+// IncrementalRecommend performs per-source incremental recommendation for users whose feedback changed.
+// Feedback-independent sources (collaborative, user-to-user, non-personalized, latest) are re-filtered
+// from cached raw scores instead of being recomputed. Feedback-dependent sources (item-to-item, external)
+// are always recomputed.
+func (p *Pipeline) IncrementalRecommend(ctx context.Context, users []data.User, progress func(completed, throughput int)) {
+	startRecommendTime := time.Now()
+	itemCache := NewItemCache(p.DataClient)
+	log.Logger().Info("incremental recommendation",
+		zap.Int("n_pending_users", len(users)),
+		zap.Int("n_jobs", p.Jobs),
+		zap.Int("cache_size", p.Config.Recommend.CacheSize))
+
+	completed := make(chan struct{}, 1000)
+	_, span := p.Tracer.Start(ctx, "Incremental recommendation", len(users))
+	defer span.End()
+
+	go func() {
+		defer util.CheckPanic()
+		completedCount, previousCount := 0, 0
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case _, ok := <-completed:
+				if !ok {
+					return
+				}
+				completedCount++
+			case <-ticker.C:
+				throughput := completedCount - previousCount
+				span.Add(throughput)
+				if progress != nil {
+					progress(completedCount, completedCount-previousCount)
+				}
+				previousCount = completedCount
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	startTime := time.Now()
+	var updateUserCount atomic.Float64
+
+	defer MemoryInuseBytesVec.WithLabelValues("user_feedback_cache").Set(0)
+	if err := parallel.Detachable(ctx, len(users), p.Jobs, p.Config.OpenAI.ChatCompletionRPM, func(pCtx *parallel.Context, jobId int) {
+		defer func() {
+			completed <- struct{}{}
+		}()
+		user := users[jobId]
+		userId := user.UserId
+
+		recommendTime := time.Now()
+		recommender, err := logics.NewRecommender(p.Config.Recommend, p.CacheClient, p.DataClient, false, userId, nil)
+		if err != nil {
+			log.Logger().Error("failed to create recommender", zap.String("user_id", userId), zap.Error(err))
+			return
+		}
+
+		// Update collaborative filtering recommendation (same as full path).
+		if !strings.EqualFold(p.Config.Recommend.Collaborative.Type, "none") && p.MatrixFactorizationUsers != nil && p.MatrixFactorizationItems != nil {
+			if userEmbedding, ok := p.MatrixFactorizationUsers.Get(userId); ok {
+				err = p.updateCollaborativeRecommend(ctx, p.MatrixFactorizationItems, userId, userEmbedding, recommender.ExcludeSet(), itemCache)
+				if err != nil {
+					log.Logger().Error("failed to recommend by collaborative filtering",
+						zap.String("user_id", userId), zap.Error(err))
+					return
+				}
+			}
+		}
+
+		// Determine recommender names.
+		var recommenderNames []string
+		if len(p.Config.Recommend.Ranker.Recommenders) > 0 {
+			recommenderNames = p.Config.Recommend.Ranker.Recommenders
+		} else {
+			recommenderNames = p.Config.Recommend.ListRecommenders()
+		}
+
+		// Per-source incremental: recompute feedback-dependent sources,
+		// re-filter feedback-independent sources from cached raw scores.
+		excludeSet := recommender.ExcludeSet()
+		var scores []cache.Score
+		var digests []string
+		for _, name := range recommenderNames {
+			if logics.IsFeedbackDependent(name) {
+				// Feedback-dependent: recompute from scratch
+				recommenderFunc, parseErr := recommender.Parse(name)
+				if parseErr != nil {
+					log.Logger().Error("failed to parse recommender", zap.String("name", name), zap.Error(parseErr))
+					continue
+				}
+				sourceScores, digest, recErr := recommenderFunc(ctx)
+				if recErr != nil {
+					log.Logger().Error("failed to recommend", zap.String("user_id", userId), zap.String("source", name), zap.Error(recErr))
+					continue
+				}
+				// Apply waterfall exclude-set
+				filtered := make([]cache.Score, 0, len(sourceScores))
+				for _, score := range sourceScores {
+					if !excludeSet.Contains(score.Id) {
+						excludeSet.Add(score.Id)
+						filtered = append(filtered, score)
+					}
+				}
+				scores = append(scores, filtered...)
+				digests = append(digests, digest)
+			} else {
+				// Feedback-independent: try loading cached raw scores
+				cachedRaw, cacheErr := p.CacheClient.SearchScores(ctx,
+					cache.SourceRecommendRaw, cache.Key(userId, name), nil, 0, p.Config.Recommend.CacheSize)
+				if cacheErr != nil || len(cachedRaw) == 0 {
+					// Cache miss: fall back to full recomputation for this source
+					recommenderFunc, parseErr := recommender.Parse(name)
+					if parseErr != nil {
+						log.Logger().Error("failed to parse recommender", zap.String("name", name), zap.Error(parseErr))
+						continue
+					}
+					sourceScores, digest, recErr := recommenderFunc(ctx)
+					if recErr != nil {
+						log.Logger().Error("failed to recommend", zap.String("user_id", userId), zap.String("source", name), zap.Error(recErr))
+						continue
+					}
+					filtered := make([]cache.Score, 0, len(sourceScores))
+					for _, score := range sourceScores {
+						if !excludeSet.Contains(score.Id) {
+							excludeSet.Add(score.Id)
+							filtered = append(filtered, score)
+						}
+					}
+					scores = append(scores, filtered...)
+					digests = append(digests, digest)
+					continue
+				}
+				// Re-filter cached raw scores with updated exclude set
+				filtered := make([]cache.Score, 0, len(cachedRaw))
+				for _, score := range cachedRaw {
+					if !excludeSet.Contains(score.Id) {
+						excludeSet.Add(score.Id)
+						filtered = append(filtered, score)
+					}
+				}
+				scores = append(scores, filtered...)
+				// Read and append cached digest
+				cachedDigest, _ := p.CacheClient.Get(ctx, cache.Key(cache.SourceRecommendRawDigest, userId, name)).String()
+				digests = append(digests, cachedDigest)
+			}
+		}
+		digest := util.MD5(digests...)
+
+		// Verify items exist (same as full path).
+		candidates := make([]cache.Score, 0, len(scores))
+		candidateSet := mapset.NewSet[string]()
+		items, err := itemCache.GetMap(ctx, lo.Map(scores, func(score cache.Score, _ int) string {
+			return score.Id
+		}))
+		if err != nil {
+			log.Logger().Error("failed to download items", zap.String("user_id", userId), zap.Error(err))
+			return
+		}
+		for _, score := range scores {
+			if _, exist := items[score.Id]; exist {
+				score.Timestamp = recommendTime
+				candidates = append(candidates, score)
+				candidateSet.Add(score.Id)
+			}
+		}
+
+		// Replacement (always recompute — reads feedback).
+		var replacementPositiveItems, replacementNegativeItems mapset.Set[string]
+		if p.Config.Recommend.Replacement.EnableReplacement && p.Config.Recommend.Ranker.Type != "none" {
+			candidates, replacementPositiveItems, replacementNegativeItems, err = p.addReplacementCandidates(
+				ctx, candidates, candidateSet, recommender.UserFeedback(), itemCache, recommendTime,
+			)
+			if err != nil {
+				log.Logger().Error("failed to prepare replacement candidates", zap.Error(err))
+				return
+			}
+		}
+
+		// Ranking (always re-run — candidates changed).
+		var results []cache.Score
+		if p.Config.Recommend.Ranker.Type == "fm" && p.ClickThroughRateModel != nil && !p.ClickThroughRateModel.Invalid() {
+			results, err = p.rankByClickTroughRate(ctx, p.ClickThroughRateModel, &user, candidates, itemCache, recommendTime)
+			if err != nil {
+				log.Logger().Error("failed to rank items", zap.Error(err))
+				return
+			}
+		} else if p.Config.Recommend.Ranker.Type == "llm" && p.Config.OpenAI.ChatCompletionModel != "" {
+			ranker, rankerErr := logics.NewChatReranker(
+				p.Config.Recommend.Ranker.RerankerAPI,
+				p.Config.Recommend.Ranker.QueryTemplate,
+				p.Config.Recommend.Ranker.DocumentTemplate)
+			if rankerErr != nil {
+				log.Logger().Error("failed to create LLM ranker", zap.Error(rankerErr))
+				return
+			}
+			results, err = p.rankByLLM(ctx, pCtx, ranker, &user, recommender.UserFeedback(), candidates, itemCache, recommendTime)
+			if err != nil {
+				log.Logger().Error("failed to rank items by LLM", zap.Error(err))
+				return
+			}
+		} else {
+			results = candidates
+		}
+
+		if p.Config.Recommend.Replacement.EnableReplacement && p.Config.Recommend.Ranker.Type != "none" {
+			results = p.applyReplacementDecay(results, replacementPositiveItems, replacementNegativeItems)
+		}
+
+		// Cache recommendation.
+		if err = p.CacheClient.AddScores(ctx, cache.Recommend, userId, results); err != nil {
+			log.Logger().Error("failed to cache recommendation", zap.Error(err))
+			return
+		}
+		if err = p.CacheClient.DeleteScores(ctx, []string{cache.Recommend}, cache.ScoreCondition{
+			Before: &recommendTime,
+			Subset: new(userId),
+		}); err != nil {
+			log.Logger().Error("failed to delete stale recommendation", zap.Error(err))
+			return
+		}
+		if err = p.CacheClient.Set(ctx,
+			cache.Time(cache.Key(cache.RecommendUpdateTime, userId), recommendTime),
+			cache.String(cache.Key(cache.RecommendDigest, userId), digest),
+		); err != nil {
+			log.Logger().Error("failed to cache recommendation time", zap.Error(err))
+		}
+		updateUserCount.Add(1)
+	}); err != nil {
+		log.Logger().Error("incremental recommendation was cancelled", zap.Error(err))
+	}
+	close(completed)
+	log.Logger().Info("complete incremental recommendation",
+		zap.String("used_time", time.Since(startTime).String()))
+	UpdateUserRecommendTotal.Add(updateUserCount.Load())
+	OfflineRecommendTotalSeconds.Add(time.Since(startRecommendTime).Seconds())
 }
 
 // ItemCache is alias of map[string]data.Item.
