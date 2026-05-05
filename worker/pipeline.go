@@ -598,13 +598,20 @@ func (p *Pipeline) applyReplacementDecay(
 	copy(updated, results)
 	changed := false
 	for i := range updated {
+		var decay float64
 		switch {
 		case positiveItems != nil && positiveItems.Contains(updated[i].Id):
-			updated[i].Score *= p.Config.Recommend.Replacement.PositiveReplacementDecay
+			decay = p.Config.Recommend.Replacement.PositiveReplacementDecay
 			changed = true
 		case negativeItems != nil && negativeItems.Contains(updated[i].Id):
-			updated[i].Score *= p.Config.Recommend.Replacement.ReadReplacementDecay
+			decay = p.Config.Recommend.Replacement.ReadReplacementDecay
 			changed = true
+		}
+		if decay > 0 {
+			// Apply decay: reduce the score by multiplying with decay factor.
+			// This is simple and predictable — positive scores stay positive but smaller,
+			// negative scores stay negative but smaller (closer to zero).
+			updated[i].Score *= decay
 		}
 	}
 	if changed {

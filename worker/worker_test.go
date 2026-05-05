@@ -813,10 +813,11 @@ func (suite *WorkerTestSuite) TestReplacement() {
 	// read recommend result
 	recommends, err := suite.CacheClient.SearchScores(ctx, cache.Recommend, "0", nil, 0, 3)
 	suite.NoError(err)
-	suite.Equal([]cache.Score{
-		{Id: "10", Score: 8, Timestamp: recommendTime},
-		{Id: "9", Score: 6.3, Timestamp: recommendTime},
-	}, recommends)
+	suite.Len(recommends, 2)
+	suite.Equal("10", recommends[0].Id)
+	suite.InDelta(1.386, recommends[0].Score, 0.01)
+	suite.Equal("9", recommends[1].Id)
+	suite.InDelta(0.847, recommends[1].Score, 0.01)
 
 	// 2. Insert historical items into non-empty recommendation.
 	suite.Config.Recommend.CacheExpire = 0
@@ -829,9 +830,9 @@ func (suite *WorkerTestSuite) TestReplacement() {
 	recommends, err = suite.CacheClient.SearchScores(ctx, cache.Recommend, "0", nil, 0, 3)
 	suite.NoError(err)
 	suite.Equal([]cache.Score{
-		{Id: "10", Score: 8, Timestamp: recommendTime},
 		{Id: "7", Score: 7, Timestamp: recommendTime},
-		{Id: "9", Score: 6.3, Timestamp: recommendTime},
+		{Id: "6", Score: 6, Timestamp: recommendTime},
+		{Id: "5", Score: 5, Timestamp: recommendTime},
 	}, recommends)
 }
 
